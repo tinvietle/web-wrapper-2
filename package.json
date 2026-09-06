@@ -1,0 +1,22 @@
+{
+  "name": "web-wrapper-2",
+  "version": "1.0.0",
+  "description": "Local WebSocket relay batches for authenticated ChatGPT and Gemini tabs",
+  "main": "scripts/apibeam-batch.js",
+  "scripts": {
+    "apibeam:relay": "node scripts/apibeam-relay.js",
+    "apibeam:relay:firefox": "APIBEAM_RELAY_PORT=8788 node scripts/apibeam-relay.js",
+    "apibeam:batch": "node scripts/apibeam-batch.js",
+    "apibeam:dry-run": "node scripts/apibeam-batch.js --dry-run --allow-unauthenticated-local",
+    "apibeam:chatgpt": "node scripts/apibeam-batch.js --input-dir chatgpt/input --output-dir chatgpt/output",
+    "apibeam:chatgpt:dry-run": "node scripts/apibeam-batch.js --dry-run --allow-unauthenticated-local --input-dir chatgpt/input --output-dir chatgpt/output",
+    "apibeam:gemini": "node scripts/apibeam-batch.js --provider gemini --input-dir chatgpt/input --output-dir gemini/output"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

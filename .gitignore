@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Local browser automation state, including authenticated profiles
+.playwright/
+.playwright-mcp/
+
+# Runtime output and diagnostics
+chatgpt/output/
+gemini/output/
+*.log
+tmp_*.png
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Local datasets, training/evaluation splits, and derived dataset exports
+429-questions/
+chatgpt/input/
+smol_json*/
+smol_json*.zip
+teacher/
+v2_dpo_recall/
+v2_sft_recall/
+Test-*.csv
+fold1_test_subset_*.json
+unsloth_*_test_*.json
+output.csv
+
+# One-off scripts coupled to the local datasets above
+audit_chatgpt_outputs.py
+create_relevance_review.py
+from_csv_to_txt.py
+from_txt_to_csv.py
+from_txt_to_smol_json.py
+review_retained_outputs.py

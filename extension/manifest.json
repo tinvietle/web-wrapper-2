@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Local AI Relay",
+  "version": "0.1.12",
+  "description": "Forwards authorized local relay requests into an authenticated ChatGPT tab.",
+  "permissions": ["alarms", "debugger", "scripting", "storage", "tabs"],
+  "host_permissions": ["https://chatgpt.com/*", "https://gemini.google.com/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:8787 ws://localhost:8787 ws://127.0.0.1:8788 ws://localhost:8788"
+  },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["https://chatgpt.com/*", "https://gemini.google.com/*"], "js": ["content.js"] }],
+  "options_page": "options.html"
+}

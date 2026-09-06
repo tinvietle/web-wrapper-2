@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Local AI Relay (Firefox)",
+  "version": "0.1.0",
+  "description": "Forwards authorized local relay requests into authenticated ChatGPT tabs in Firefox.",
+  "permissions": ["alarms", "scripting", "storage", "tabs"],
+  "host_permissions": ["https://chatgpt.com/*", "https://gemini.google.com/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:8788 ws://localhost:8788"
+  },
+  "background": { "scripts": ["background.js"], "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["https://chatgpt.com/*", "https://gemini.google.com/*"], "js": ["content.js"] }],
+  "options_ui": { "page": "options.html" }
+}
