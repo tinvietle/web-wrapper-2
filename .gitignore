@@ -40,3 +40,4 @@ from_csv_to_txt.py
 from_txt_to_csv.py
 from_txt_to_smol_json.py
 review_retained_outputs.py
+prompt.txt

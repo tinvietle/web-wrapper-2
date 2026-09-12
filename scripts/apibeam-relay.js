@@ -7,6 +7,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 const port = Number.parseInt(process.env.APIBEAM_RELAY_PORT || '8787', 10);
 const host = process.env.APIBEAM_RELAY_HOST || '127.0.0.1';
 const token = process.env.APIBEAM_RELAY_TOKEN || '';
+const extensionReconnectGraceMs = Number.parseInt(process.env.EXTENSION_RECONNECT_GRACE_MS || '45000', 10);
 
 if (!token) {
   console.error('Set APIBEAM_RELAY_TOKEN before starting the relay.');
@@ -32,11 +33,13 @@ const server = http.createServer((request, response) => {
       requestId,
       state: request.state,
       ageMs: Date.now() - request.startedAt,
+      idleMs: Date.now() - request.lastProgressAt,
     })),
   }));
 });
 const sockets = new WebSocketServer({ server });
 let extensionSocket = null;
+let extensionDisconnectTimer = null;
 const requests = new Map();
 
 function send(socket, message) {
@@ -58,6 +61,7 @@ sockets.on('connection', (socket) => {
       if (socket.role === 'extension') {
         if (extensionSocket && extensionSocket !== socket) extensionSocket.close(1000, 'Replaced by a newer extension connection');
         extensionSocket = socket;
+        clearTimeout(extensionDisconnectTimer);
       }
       return send(socket, { type: 'authenticated', role: socket.role });
     }
@@ -65,40 +69,63 @@ sockets.on('connection', (socket) => {
     if (socket.role === 'client' && message.type === 'request') {
       if (!message.requestId || typeof message.prompt !== 'string') return send(socket, { type: 'error', requestId: message.requestId, error: 'requestId and prompt are required.' });
       if (!extensionSocket) return send(socket, { type: 'error', requestId: message.requestId, error: 'No authenticated browser extension is connected.' });
-      requests.set(message.requestId, { client: socket, state: 'forwarded', startedAt: Date.now() });
+      const now = Date.now();
+      requests.set(message.requestId, { client: socket, state: 'forwarded', startedAt: now, lastProgressAt: now });
       return send(extensionSocket, { type: 'request', requestId: message.requestId, provider: message.provider, prompt: message.prompt, metadata: message.metadata || {} });
+    }
+
+    if (socket.role === 'client' && message.type === 'cancel') {
+      const request = requests.get(message.requestId);
+      requests.delete(message.requestId);
+      if (request && extensionSocket) send(extensionSocket, { type: 'cancel', requestId: message.requestId });
+      return;
     }
 
     if (socket.role === 'extension' && message.type === 'accepted') {
       const request = requests.get(message.requestId);
-      if (request) request.state = 'accepted_by_extension';
+      if (request) {
+        request.state = 'accepted_by_extension';
+        request.lastProgressAt = Date.now();
+        send(request.client, message);
+      }
       return;
     }
 
     if (socket.role === 'extension' && message.type === 'progress') {
       const request = requests.get(message.requestId);
-      if (request && typeof message.state === 'string') request.state = message.state;
+      if (request && typeof message.state === 'string') {
+        request.state = message.state;
+        request.lastProgressAt = Date.now();
+        send(request.client, message);
+      }
       return;
     }
+
+    if (socket.role === 'extension' && message.type === 'heartbeat') return;
 
     if (socket.role === 'extension' && ['response', 'error'].includes(message.type)) {
       const request = requests.get(message.requestId);
       requests.delete(message.requestId);
       if (request) send(request.client, message);
+      send(socket, { type: 'delivery_ack', requestId: message.requestId });
     }
   });
 
   socket.on('close', () => {
     if (extensionSocket === socket) {
       extensionSocket = null;
-      for (const [requestId, request] of requests) {
-        requests.delete(requestId);
-        send(request.client, {
-          type: 'error',
-          requestId,
-          error: 'Browser extension disconnected before returning a response.',
-        });
-      }
+      clearTimeout(extensionDisconnectTimer);
+      extensionDisconnectTimer = setTimeout(() => {
+        if (extensionSocket) return;
+        for (const [requestId, request] of requests) {
+          requests.delete(requestId);
+          send(request.client, {
+            type: 'error',
+            requestId,
+            error: `Browser extension did not reconnect within ${extensionReconnectGraceMs}ms.`,
+          });
+        }
+      }, extensionReconnectGraceMs);
     }
     for (const [requestId, request] of requests) {
       if (request.client === socket) requests.delete(requestId);

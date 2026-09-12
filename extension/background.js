@@ -1,5 +1,6 @@
 let socket;
 let reconnectTimer;
+let keepAliveTimer;
 let connectionStatus = 'Not configured';
 let connectionError = '';
 const tabQueues = new Map();
@@ -7,6 +8,7 @@ const captureWaiters = new Map();
 const intentionalDebuggerDetaches = new Set();
 let tabAssignmentLock = Promise.resolve();
 let jobStorageLock = Promise.resolve();
+let outboxStorageLock = Promise.resolve();
 
 async function config() {
   return chrome.storage.sync.get({ relayUrl: 'ws://127.0.0.1:8787', relayToken: '' });
@@ -85,15 +87,49 @@ function queueTabJob(tabId, job) {
   return scheduled;
 }
 
-function waitForCapture(requestId) {
-  return new Promise((resolve) => captureWaiters.set(requestId, resolve));
+function waitForCapture(requestId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      captureWaiters.delete(requestId);
+      reject(new Error('Internal response capture timed out.'));
+    }, timeoutMs);
+    captureWaiters.set(requestId, { resolve, timeout });
+  });
 }
 
 function settleCapture(message) {
-  const resolve = captureWaiters.get(message.requestId);
-  if (!resolve) return;
+  const waiter = captureWaiters.get(message.requestId);
+  if (!waiter) return;
   captureWaiters.delete(message.requestId);
-  resolve(message);
+  clearTimeout(waiter.timeout);
+  waiter.resolve(message);
+}
+
+function updateTerminalOutbox(update) {
+  const storageKey = 'terminalOutbox';
+  const operation = outboxStorageLock.then(async () => {
+    const { [storageKey]: outbox = {} } = await chrome.storage.session.get(storageKey);
+    const result = update(outbox);
+    await chrome.storage.session.set({ [storageKey]: outbox });
+    return result;
+  });
+  outboxStorageLock = operation.catch(() => {});
+  return operation;
+}
+
+async function queueTerminal(message) {
+  await updateTerminalOutbox((outbox) => { outbox[message.requestId] = message; });
+  await flushTerminalOutbox();
+}
+
+async function flushTerminalOutbox() {
+  if (socket?.readyState !== WebSocket.OPEN || connectionStatus !== 'Connected') return;
+  const { terminalOutbox = {} } = await chrome.storage.session.get('terminalOutbox');
+  for (const message of Object.values(terminalOutbox)) send(message);
+}
+
+async function acknowledgeTerminal(requestId) {
+  await updateTerminalOutbox((outbox) => { delete outbox[requestId]; });
 }
 
 async function saveActiveJob(provider, key, tabId, message) {
@@ -106,8 +142,18 @@ async function saveActiveJob(provider, key, tabId, message) {
       workerId: key,
       tabId,
       action: message.metadata?.action || 'case',
+      prompt: message.prompt,
+      responseTimeoutMs: Number(message.metadata?.responseTimeoutMs) || 600000,
       startedAt: Date.now(),
     };
+  });
+}
+
+async function updateActiveJobByRequestId(requestId, update) {
+  return updateActiveJobs((jobs) => {
+    for (const job of Object.values(jobs)) {
+      if (job.requestId === requestId) update(job);
+    }
   });
 }
 
@@ -116,6 +162,70 @@ async function clearActiveJob(provider, key, requestId) {
   return updateActiveJobs((jobs) => {
     if (jobs[jobKey]?.requestId === requestId) delete jobs[jobKey];
   });
+}
+
+async function clearActiveJobByRequestId(requestId) {
+  return updateActiveJobs((jobs) => {
+    for (const [jobKey, job] of Object.entries(jobs)) {
+      if (job.requestId === requestId) delete jobs[jobKey];
+    }
+  });
+}
+
+async function cancelRequest(requestId) {
+  const cancelled = await updateActiveJobs((jobs) => {
+    const matching = Object.values(jobs).filter((job) => job.requestId === requestId);
+    for (const [jobKey, job] of Object.entries(jobs)) if (job.requestId === requestId) delete jobs[jobKey];
+    return matching;
+  });
+  for (const job of cancelled) {
+    await chrome.tabs.sendMessage(job.tabId, { type: 'cancel-capture', requestId }).catch(() => {});
+  }
+  settleCapture({ type: 'error', requestId, error: 'Request cancelled by client.' });
+}
+
+async function recoverActiveJobs() {
+  const { activeProviderJobs: jobs = {} } = await chrome.storage.session.get('activeProviderJobs');
+  for (const job of Object.values(jobs)) {
+    try {
+      const provider = getProvider(job.provider);
+      if (job.action === 'new_chat') {
+        const state = await ensureContentScript(job.tabId, provider.name);
+        if (state?.composerAvailable && !state.assistantText) {
+          await queueTerminal({ type: 'response', requestId: job.requestId, response: 'new chat started' });
+        } else {
+          await queueTerminal({ type: 'error', requestId: job.requestId, error: 'Extension restarted before the new chat could be confirmed.' });
+        }
+        await clearActiveJobByRequestId(job.requestId);
+        continue;
+      }
+      if (!job.previousAssistant) {
+        await queueTerminal({ type: 'error', requestId: job.requestId, error: 'Extension restarted before prompt submission could be confirmed.' });
+        await clearActiveJobByRequestId(job.requestId);
+        continue;
+      }
+      const elapsedMs = Date.now() - job.startedAt;
+      const captureTimeoutMs = job.responseTimeoutMs - elapsedMs - 10000;
+      if (captureTimeoutMs < 5000) {
+        await queueTerminal({ type: 'error', requestId: job.requestId, error: 'Response capture expired while the extension was restarting.' });
+        await clearActiveJobByRequestId(job.requestId);
+        continue;
+      }
+      await ensureContentScript(job.tabId, provider.name);
+      await chrome.tabs.sendMessage(job.tabId, {
+        type: 'capture-response',
+        provider: provider.name,
+        requestId: job.requestId,
+        prompt: job.prompt,
+        previousAssistant: job.previousAssistant,
+        captureTimeoutMs,
+      });
+      sendProgress(job.requestId, 'capture_resumed_after_restart');
+    } catch (error) {
+      await queueTerminal({ type: 'error', requestId: job.requestId, error: `Could not resume response capture: ${error.message}` });
+      await clearActiveJobByRequestId(job.requestId);
+    }
+  }
 }
 
 async function failJobsForTab(tabId, error) {
@@ -128,7 +238,7 @@ async function failJobsForTab(tabId, error) {
     }
     return matching;
   });
-  for (const job of failed) send({ type: 'error', requestId: job.requestId, error });
+  for (const job of failed) await queueTerminal({ type: 'error', requestId: job.requestId, error });
 }
 
 function updateActiveJobs(update) {
@@ -164,6 +274,7 @@ async function forgetTab(tabId, reason) {
 
 async function connect() {
   clearTimeout(reconnectTimer);
+  if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
   const { relayUrl, relayToken } = await config();
   if (!relayToken) {
     connectionStatus = 'Not configured';
@@ -171,12 +282,25 @@ async function connect() {
   }
   connectionStatus = 'Connecting';
   connectionError = '';
-  socket = new WebSocket(relayUrl);
-  socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'authenticate', role: 'extension', token: relayToken })));
-  socket.addEventListener('message', async (event) => {
+  const currentSocket = new WebSocket(relayUrl);
+  socket = currentSocket;
+  currentSocket.addEventListener('open', () => currentSocket.send(JSON.stringify({ type: 'authenticate', role: 'extension', token: relayToken })));
+  currentSocket.addEventListener('message', async (event) => {
     const message = JSON.parse(event.data);
     if (message.type === 'authenticated') {
       connectionStatus = 'Connected';
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = setInterval(() => send({ type: 'heartbeat', timestamp: Date.now() }), 20000);
+      await flushTerminalOutbox();
+      await recoverActiveJobs();
+      return;
+    }
+    if (message.type === 'delivery_ack') {
+      await acknowledgeTerminal(message.requestId);
+      return;
+    }
+    if (message.type === 'cancel') {
+      await cancelRequest(message.requestId);
       return;
     }
     if (message.type !== 'request') return;
@@ -196,18 +320,21 @@ async function connect() {
           await clearActiveJob(provider, key, message.requestId);
         }
       };
-      queueTabJob(tab.id, task).catch((error) => send({ type: 'error', requestId: message.requestId, error: error.message }));
+      queueTabJob(tab.id, task).catch((error) => queueTerminal({ type: 'error', requestId: message.requestId, error: error.message }));
     } catch (error) {
-      send({ type: 'error', requestId: message.requestId, error: error.message });
+      await queueTerminal({ type: 'error', requestId: message.requestId, error: error.message });
     }
   });
-  socket.addEventListener('close', () => {
-    if (connectionStatus !== 'Connected') connectionStatus = 'Disconnected';
+  currentSocket.addEventListener('close', () => {
+    if (socket !== currentSocket) return;
+    clearInterval(keepAliveTimer);
+    connectionStatus = 'Disconnected';
+    socket = null;
     reconnectTimer = setTimeout(connect, 3000);
   });
-  socket.addEventListener('error', () => {
+  currentSocket.addEventListener('error', () => {
     connectionError = 'Could not connect. Check the relay URL, token, and that the relay is running.';
-    socket.close();
+    currentSocket.close();
   });
 }
 
@@ -227,7 +354,7 @@ async function startNewChat(tabId, message, provider) {
       });
       if (!result.result?.value) throw new Error(`Could not find the ${provider.name} New chat control.`);
       await waitForFreshChat(tabId, provider.name);
-      send({ type: 'response', requestId: message.requestId, response: 'new chat started' });
+      await queueTerminal({ type: 'response', requestId: message.requestId, response: 'new chat started' });
       return;
     } catch (error) {
       lastError = error;
@@ -273,7 +400,7 @@ async function ensureContentScript(tabId, provider) {
     return await chrome.tabs.sendMessage(tabId, { type: 'assistant-state', provider });
   } catch {
     // A tab opened before the extension was loaded has no content script yet.
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['response-state.js', 'content.js'] });
     return chrome.tabs.sendMessage(tabId, { type: 'assistant-state', provider });
   }
 }
@@ -307,6 +434,10 @@ async function submitRequest(tabId, message, provider) {
   await activateProviderTab(tabId);
   const state = await ensureContentScript(tabId, provider.name);
   if (!state?.composerAvailable) throw new Error('ChatGPT prompt composer was not found.');
+  await updateActiveJobByRequestId(message.requestId, (job) => {
+    job.previousAssistant = state.assistantSnapshot || { text: state.assistantText || '', count: 0, key: '' };
+    job.phase = 'submitting';
+  });
 
   const debuggee = { tabId };
   let attached = false;
@@ -342,20 +473,30 @@ async function submitRequest(tabId, message, provider) {
       if (!await clickSendButton(debuggee)) throw new Error('ChatGPT kept the prompt in the composer and its Send button was unavailable.');
       sendProgress(message.requestId, 'send_button_clicked');
     }
+    await updateActiveJobByRequestId(message.requestId, (job) => { job.phase = 'capturing'; });
   } finally {
     if (attached) await detachDebugger(debuggee);
   }
 
-  const captured = waitForCapture(message.requestId);
+  const responseTimeoutMs = Math.max(15000, Number(message.metadata?.responseTimeoutMs) || 600000);
+  const captured = waitForCapture(message.requestId, responseTimeoutMs - 5000);
   try {
     await chrome.tabs.sendMessage(tabId, {
-      type: 'capture-response', provider: provider.name, requestId: message.requestId, prompt: message.prompt, previousAssistantText: state.assistantText,
+      type: 'capture-response', provider: provider.name, requestId: message.requestId, prompt: message.prompt,
+      previousAssistant: state.assistantSnapshot,
+      previousAssistantText: state.assistantText,
+      captureTimeoutMs: responseTimeoutMs - 10000,
     });
   } catch (error) {
-    captureWaiters.delete(message.requestId);
+    settleCapture({ type: 'error', requestId: message.requestId, error: error.message });
     throw error;
   }
-  await captured;
+  try {
+    await captured;
+  } catch (error) {
+    await chrome.tabs.sendMessage(tabId, { type: 'cancel-capture', requestId: message.requestId }).catch(() => {});
+    throw error;
+  }
 }
 
 function sendProgress(requestId, state) {
@@ -367,19 +508,28 @@ function send(message) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (['accepted', 'progress', 'response', 'error'].includes(message?.type)) {
+  if (['accepted', 'progress'].includes(message?.type)) {
     if (message.type === 'progress' && message.state === 'response_waiting' && sender.tab?.id) {
       activateProviderTab(sender.tab.id).catch(() => {});
     }
-    if (['response', 'error'].includes(message.type)) settleCapture(message);
     send(message);
+  }
+  if (['response', 'error'].includes(message?.type)) {
+    settleCapture(message);
+    Promise.all([clearActiveJobByRequestId(message.requestId), queueTerminal(message)])
+      .then(() => sendResponse({ accepted: true }))
+      .catch((error) => sendResponse({ accepted: false, error: error.message }));
+    return true;
   }
   if (message?.type === 'connection-status') {
     sendResponse({ status: connectionStatus, error: connectionError });
   }
 });
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === 'sync' && ('relayUrl' in changes || 'relayToken' in changes)) connect();
+  if (areaName === 'sync' && ('relayUrl' in changes || 'relayToken' in changes)) {
+    socket?.close(1000, 'Configuration changed');
+    connect();
+  }
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (intentionalDebuggerDetaches.has(source.tabId)) {

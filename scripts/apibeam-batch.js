@@ -165,10 +165,14 @@ class RelayClient {
   async request({ prompt, fileName, action = 'case', workerId = 'default' }) {
     await this.connect();
     const requestId = randomUUID();
-    const payload = { type: 'request', requestId, token: this.options.relayToken || undefined, provider: this.options.provider, prompt, metadata: { fileName, action, workerId } };
+    const payload = { type: 'request', requestId, token: this.options.relayToken || undefined, provider: this.options.provider, prompt, metadata: { fileName, action, workerId, responseTimeoutMs: this.options.responseTimeoutMs } };
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => { this.pending.delete(requestId); reject(new Error(`Timed out waiting for relay response after ${this.options.responseTimeoutMs}ms.`)); }, this.options.responseTimeoutMs);
-      this.pending.set(requestId, { resolve, reject, timeout });
+      const timeout = setTimeout(() => {
+        this.pending.delete(requestId);
+        if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: 'cancel', requestId }));
+        reject(new Error(`Timed out waiting for relay response after ${this.options.responseTimeoutMs}ms.`));
+      }, this.options.responseTimeoutMs);
+      this.pending.set(requestId, { resolve, reject, timeout, state: 'sent' });
       this.socket.send(JSON.stringify(payload));
     });
   }
@@ -178,6 +182,14 @@ class RelayClient {
     try { message = JSON.parse(String(rawMessage)); } catch { return; }
     const pending = this.pending.get(message.requestId);
     if (!pending) return;
+    if (message.type === 'accepted' || message.type === 'progress') {
+      const state = message.type === 'accepted' ? 'accepted_by_extension' : message.state;
+      if (state && state !== pending.state) {
+        pending.state = state;
+        console.log(`  Relay state: ${state}`);
+      }
+      return;
+    }
     clearTimeout(pending.timeout);
     this.pending.delete(message.requestId);
     if (message.type === 'response' && typeof message.response === 'string') return pending.resolve(message.response);

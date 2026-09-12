@@ -4,6 +4,7 @@
   "description": "Local WebSocket relay batches for authenticated ChatGPT and Gemini tabs",
   "main": "scripts/apibeam-batch.js",
   "scripts": {
+    "test": "node --test scripts/*.test.js",
     "apibeam:relay": "node scripts/apibeam-relay.js",
     "apibeam:relay:firefox": "APIBEAM_RELAY_PORT=8788 node scripts/apibeam-relay.js",
     "apibeam:batch": "node scripts/apibeam-batch.js",
